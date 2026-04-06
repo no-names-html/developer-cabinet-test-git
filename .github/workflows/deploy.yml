@@ -1,0 +1,84 @@
+name: Pipeline Deploy
+
+on:
+  push:
+    branches:
+      - staging
+      - main
+    paths-ignore:
+      - '.github/workflows/**'
+  workflow_dispatch:
+
+jobs:
+  # STAGING: збирає ZIP, зберігає артефакт, деплоїть на STAGING контейнер
+  deploy-staging:
+    if: github.ref == 'refs/heads/staging'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Create project archive
+        run: |
+          zip -r project.zip . -x "*.git*" -x "image/*" -x "image"
+          ls -lh project.zip
+
+      - name: Upload artifact for promotion
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ github.sha }}
+          path: project.zip
+          retention-days: 30
+
+      - name: Deploy to STAGING
+        run: |
+          CURL_ARGS=(-X POST \
+            -H "X-Deploy-Token: ${{ secrets.DEPLOY_TOKEN_STAGING }}" \
+            -F "file=@project.zip" \
+            -F "deployment_id=${{ secrets.DEPLOYMENT_ID_STAGING }}")
+          if [ -n "${{ secrets.CUSTOM_DOMAIN_STAGING }}" ]; then
+            CURL_ARGS+=(-F "domain=${{ secrets.CUSTOM_DOMAIN_STAGING }}")
+          fi
+          curl "${CURL_ARGS[@]}" \
+            "${{ secrets.SERVER_URL }}?section=deployments&action=autoRedeploy"
+
+  # PRODUCTION: бере артефакт від staging (без пересборки) і деплоїть на PROD
+  deploy-prod:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download staging artifact
+        id: download
+        uses: dawidd6/action-download-artifact@v6
+        continue-on-error: true
+        with:
+          branch: staging
+          name: release-.*
+          name_is_regexp: true
+          search_artifacts: true
+          sort: created
+          limit: 1
+
+      - name: Check artifact exists
+        if: steps.download.outcome == 'failure'
+        run: |
+          echo "No staging artifact found. Run staging pipeline first."
+          echo "Skipping production deployment."
+          exit 0
+
+      - name: Deploy to PRODUCTION
+        if: steps.download.outcome == 'success'
+        run: |
+          CURL_ARGS=(-X POST \
+            -H "X-Deploy-Token: ${{ secrets.DEPLOY_TOKEN_PROD }}" \
+            -F "file=@project.zip" \
+            -F "deployment_id=${{ secrets.DEPLOYMENT_ID_PROD }}")
+          if [ -n "${{ secrets.CUSTOM_DOMAIN }}" ]; then
+            CURL_ARGS+=(-F "domain=${{ secrets.CUSTOM_DOMAIN }}")
+          fi
+          curl "${CURL_ARGS[@]}" \
+            "${{ secrets.SERVER_URL }}?section=deployments&action=autoRedeploy"
+
+      - name: Deployment status
+        if: steps.download.outcome == 'success'
+        run: echo "Production deployment completed successfully!"
